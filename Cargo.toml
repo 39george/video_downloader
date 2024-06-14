@@ -7,13 +7,14 @@ edition = "2021"
 tokio = { version = "1.38.0", features = [
   "macros",
   "rt-multi-thread",
+  "process"
 ] }
-fantoccini = "0.19.3"
-webdriver = "0.50.0"
+clap = { version = "4.5.7", features = ["derive"] }
 futures = "0.3.30"
 thirtyfour = "0.32.0"
+hudsucker = "0.22.0"
+uuid = "1.8.0"
 serde = { version = "1.0.201", features = ["derive"] }
 serde_json = "1.0.117"
-headless_chrome = {git = "https://github.com/rust-headless-chrome/rust-headless-chrome", features = ["fetch"]}
 anyhow = "1.0.86"
 regex = "1.10.5"
