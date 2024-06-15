@@ -11,8 +11,8 @@ use thirtyfour::{
 };
 use tokio::sync::mpsc::Sender;
 
-use crate::interceptor::{self, Signal};
 use crate::print_err;
+use crate::proxy::{self, Signal};
 use crate::video_saver::{VideoInfo, VideoSaver};
 
 use self::href::Href;
@@ -222,7 +222,7 @@ async fn store_video(
 
 async fn run_proxy() -> Result<Sender<Signal>, anyhow::Error> {
     let (tx, rx) = tokio::sync::mpsc::channel(10000);
-    interceptor::run_interceptor(rx).await;
+    proxy::run_interceptor(rx).await;
     Ok(tx)
 }
 

@@ -8,12 +8,6 @@ use hudsucker::{
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc::{Receiver, Sender};
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C signal handler");
-}
-
 pub enum Signal {
     StartListening,
     StopListening(tokio::sync::oneshot::Sender<Vec<String>>),
@@ -40,26 +34,6 @@ impl HttpHandler for Interceptor {
             }
         }
         req.into()
-    }
-
-    async fn handle_response(
-        &mut self,
-        _ctx: &HttpContext,
-        res: Response<Body>,
-    ) -> Response<Body> {
-        // println!("{:?}", res);
-        res
-    }
-}
-
-impl WebSocketHandler for Interceptor {
-    async fn handle_message(
-        &mut self,
-        _ctx: &WebSocketContext,
-        msg: Message,
-    ) -> Option<Message> {
-        // println!("{:?}", msg);
-        Some(msg)
     }
 }
 
@@ -131,10 +105,9 @@ oMKSHK2k0g==
         .with_rustls_client()
         .with_ca(ca)
         .with_http_handler(Interceptor { tx: Arc::new(tx) })
-        // .with_graceful_shutdown(shutdown_signal())
         .build();
 
-    spawn_manager_task(wd_rx, req_rx);
+    spawn_interceptor_task(wd_rx, req_rx);
 
     tokio::spawn(async move {
         if let Err(e) = proxy.start().await {
@@ -143,9 +116,9 @@ oMKSHK2k0g==
     });
 }
 
-fn spawn_manager_task(
+fn spawn_interceptor_task(
     mut wd_rx: Receiver<Signal>,
-    mut req_url_rx: Receiver<String>,
+    mut proxy_rx: Receiver<String>,
 ) {
     tokio::spawn(async move {
         let mut is_listening = false;
@@ -157,15 +130,15 @@ fn spawn_manager_task(
                         Some(Signal::StartListening) => is_listening = true,
                         Some(Signal::StopListening(tx)) => {
                             is_listening = false;
-                            if let Err(e) = tx.send(collected.clone()) {
-                                println!("Failed to send {:?} to main app", e);
+                            if let Err(vec) = tx.send(collected.clone()) {
+                                println!("Failed to send {:?} to main app", vec);
                             }
                             collected.clear();
                         }
                         None => break,
                     }
                 }
-                req = req_url_rx.recv(), if is_listening => {
+                req = proxy_rx.recv(), if is_listening => {
                     match req {
                         Some(url) => {
                             collected.push(url);
