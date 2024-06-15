@@ -1,22 +1,28 @@
-use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::{path::PathBuf, process::Stdio};
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Receiver;
-use tokio::time::timeout;
 
 fn urls_regex() -> &'static Regex {
     static HREF_REGEX: OnceLock<Regex> = OnceLock::new();
     HREF_REGEX.get_or_init(|| Regex::new(r#"(?P<domain>[^:]+):[0-9]+\/player\/(?P<id>[^\/]+)\/[^\/]+\/media\/(?P<file>[^?]+)\.m3u8.*"#).unwrap())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VideoInfo {
     pub path: String,
-    pub name: String,
     pub urls: Vec<String>,
+}
+
+impl FromStr for VideoInfo {
+    type Err = serde_json::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_str(s)
+    }
 }
 
 pub struct VideoSaver {
@@ -37,11 +43,17 @@ impl VideoSaver {
     ) -> tokio::task::JoinHandle<Vec<(VideoInfo, anyhow::Error)>> {
         tokio::spawn(async move {
             while let Some(video_info) = self.rx.recv().await {
-                println!("Got video info, start downloading");
+                tracing::info!(
+                    "Got video info, start downloading, currently in queue: {}",
+                    self.rx.len()
+                );
                 match write_file(video_info).await {
-                    Ok(()) => println!("Succesfully downloaded file"),
+                    Ok(path) => tracing::info!(
+                        "Succesfully downloaded file: {}",
+                        path.to_string_lossy()
+                    ),
                     Err(e) => {
-                        println!("Failed to download video: {}", e.1);
+                        tracing::error!("Failed to download video: {}", e.1);
                         self.failed.push(e)
                     }
                 }
@@ -53,18 +65,25 @@ impl VideoSaver {
 
 async fn write_file(
     video_info: VideoInfo,
-) -> Result<(), (VideoInfo, anyhow::Error)> {
+) -> Result<PathBuf, (VideoInfo, anyhow::Error)> {
     let url = select_url(video_info.urls.clone())
         .map_err(|e| (video_info.clone(), e))?
         .extract();
     let path = PathBuf::from(format!("./{}", video_info.path));
     if let Err(err) = std::fs::create_dir_all(&path) {
-        eprintln!("Error creating directory: {}", err);
+        tracing::error!("Error creating directory: {}", err);
     } else {
-        println!("Directory created successfully!");
+        tracing::info!("Directory created successfully!");
     }
 
-    let filepath = path.join(video_info.name.clone());
+    let filepath = path.join(format!("{}.mp4", hash_string(&url)));
+
+    if filepath.exists() {
+        tracing::warn!(
+            "File already exists, skip: {}",
+            filepath.to_string_lossy()
+        );
+    }
 
     let mut child = tokio::process::Command::new("ffmpeg")
         .args(&[
@@ -76,6 +95,8 @@ async fn write_file(
             "copy",
             filepath.to_str().unwrap(),
         ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| (video_info.clone(), anyhow!("Failed: {e}")))?;
     let status = child
@@ -83,7 +104,7 @@ async fn write_file(
         .await
         .map_err(|e| (video_info.clone(), anyhow!("Failed: {e}")))?;
     if status.success() {
-        Ok(())
+        Ok(filepath)
     } else {
         Err((video_info, anyhow!("Failed: exited with nonzero code")))
     }
@@ -167,6 +188,12 @@ fn select_url(urls: Vec<String>) -> Result<TypedUrl, anyhow::Error> {
         .into_iter()
         .max()
         .ok_or(anyhow!("Failed to find highest priority url"))
+}
+
+fn hash_string(s: &str) -> String {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(s, &mut hasher);
+    std::hash::Hasher::finish(&hasher).to_string()
 }
 
 #[cfg(test)]

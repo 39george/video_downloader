@@ -2202,6 +2202,8 @@ dependencies = [
  "serde_json",
  "thirtyfour",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

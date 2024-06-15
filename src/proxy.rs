@@ -8,6 +8,8 @@ use hudsucker::{
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc::{Receiver, Sender};
 
+use crate::print_err;
+
 pub enum Signal {
     StartListening,
     StopListening(tokio::sync::oneshot::Sender<Vec<String>>),
@@ -29,9 +31,7 @@ impl HttpHandler for Interceptor {
             .to_string()
             .contains("https://player02.getcourse.ru:443/player")
         {
-            if let Err(e) = self.tx.send(req.uri().to_string()).await {
-                println!("Failed to send uri from interceptor: {e}");
-            }
+            print_err!(self.tx.send(req.uri().to_string()).await, ());
         }
         req.into()
     }
@@ -111,7 +111,7 @@ oMKSHK2k0g==
 
     tokio::spawn(async move {
         if let Err(e) = proxy.start().await {
-            println!("Proxy error: {}", e);
+            tracing::error!("Proxy error: {}", e);
         }
     });
 }
@@ -131,7 +131,7 @@ fn spawn_interceptor_task(
                         Some(Signal::StopListening(tx)) => {
                             is_listening = false;
                             if let Err(vec) = tx.send(collected.clone()) {
-                                println!("Failed to send {:?} to main app", vec);
+                                tracing::error!("Failed to send {:?} to main app", vec);
                             }
                             collected.clear();
                         }
@@ -144,7 +144,7 @@ fn spawn_interceptor_task(
                             collected.push(url);
                         },
                         None => {
-                            println!("Error, channel with proxy is closed");
+                            tracing::error!("Error, channel with proxy is closed");
                         },
                     }
                 }

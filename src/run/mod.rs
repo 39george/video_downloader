@@ -1,7 +1,7 @@
 use std::collections::HashSet;
-use std::error::Error;
 use std::fs::{read_to_string, File};
 use std::io::Write;
+use std::process::exit;
 use std::time::Duration;
 
 use futures::future::{BoxFuture, FutureExt};
@@ -10,30 +10,62 @@ use thirtyfour::{
     By, CapabilitiesHelper, Cookie, DesiredCapabilities, WebDriver,
 };
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinHandle;
 
-use crate::print_err;
 use crate::proxy::{self, Signal};
 use crate::video_saver::{VideoInfo, VideoSaver};
+use crate::{print_err, Args};
 
 use self::href::Href;
 
 mod href;
 
 #[tokio::main]
-pub async fn run() -> Result<(), Box<dyn Error>> {
+pub async fn run(args: Args) -> Result<(), anyhow::Error> {
     // Prepare communication
     let interceptor_tx = run_proxy().await.unwrap();
     let (saver_tx, saver_rx) = tokio::sync::mpsc::channel(10000);
     let video_saver = VideoSaver::new(saver_rx);
     let video_saver_handle = video_saver.run_video_saver();
 
+    if let Some(path) = args.path_to_videos_info_file {
+        if !path.exists() {
+            tracing::error!("Not found file: {}", path.to_string_lossy());
+            exit(1);
+        }
+        let contents = match read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to read file: {}, error: {e}",
+                    path.to_string_lossy()
+                );
+                exit(2);
+            }
+        };
+        let info: Vec<VideoInfo> = match serde_json::from_str(&contents) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::error!("Failed to deserialize videos info: {e}",);
+                exit(3);
+            }
+        };
+        for i in info {
+            saver_tx.send(i).await?;
+        }
+        // Drop tx so video saver can stop
+        drop(saver_tx);
+        wait_video_saver(video_saver_handle).await;
+        exit(0);
+    }
+
     // Setup webdriver
     let mut caps = DesiredCapabilities::firefox();
     caps.set_page_load_strategy(thirtyfour::PageLoadStrategy::Eager)
         .unwrap();
     caps.set_proxy(thirtyfour::Proxy::Manual {
-        http_proxy: Some("127.0.0.1:8080".to_string()),
-        ssl_proxy: Some("127.0.0.1:8080".to_string()),
+        http_proxy: Some(format!("127.0.0.1:{}", args.proxy_port)),
+        ssl_proxy: Some(format!("127.0.0.1:{}", args.proxy_port)),
         socks_proxy: None,
         socks_version: None,
         socks_username: None,
@@ -43,14 +75,30 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     })
     .unwrap();
     caps.accept_insecure_certs(true).unwrap();
-    let wd = WebDriver::new("http://localhost:4444", caps).await?;
+    let wd = match WebDriver::new(args.geckodriver_address, caps).await {
+        Ok(wd) => wd,
+        Err(e) => {
+            tracing::error!(
+                "Seems that geckodriver is not started or wrong port is set up: {e}"
+            );
+            exit(4);
+        }
+    };
 
     // Prepare paths
-    let base = "/teach/control";
-    let root = "/teach/control/stream/index";
-    let domain = "https://universkill.ru";
+    let base = &args.base;
+    let root = &args.root;
+    let domain = &args.domain;
 
-    load_root_page(&wd, domain, root).await?;
+    load_root_page(
+        &wd,
+        domain,
+        root,
+        &args.password,
+        &args.email,
+        &args.auth_url,
+    )
+    .await?;
 
     let pagename = wd.title().await.unwrap_or("NotNamedPage".to_string());
     let filepath = vec![pagename];
@@ -79,20 +127,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         ()
     );
 
-    match video_saver_handle.await {
-        Ok(failed) => {
-            if failed.is_empty() {
-                println!(
-                    "There are no failed videos to download, congratulations!"
-                );
-            } else {
-                println!("Got failed videos to download: {:?}", failed);
-            }
-        }
-        Err(e) => {
-            println!("Failed to join video saver: {e}");
-        }
-    }
+    wait_video_saver(video_saver_handle).await;
 
     // Close webdriver session
     wd.quit().await.unwrap();
@@ -120,12 +155,18 @@ fn process_selectors<'a>(
             if let Err(e) =
                 wd.goto(&format!("{}:{}", domain, href.as_ref())).await
             {
-                println!("Failed to navigate to: {:?}, error: {e}", href);
+                tracing::error!(
+                    "Failed to navigate to: {:?}, error: {e}",
+                    href
+                );
                 continue;
             } else {
                 let dom = wd.source().await.unwrap();
                 if does_page_contains_videos(&dom) {
-                    println!("Found video: {}", merge_path(&filepath));
+                    tracing::info!(
+                        "Found page contains videos: {}",
+                        merge_path(&filepath)
+                    );
                     print_err!(
                         store_video(
                             wd,
@@ -186,12 +227,16 @@ async fn store_video(
                     print_err!(button.click().await, ());
                     break;
                 }
-                _ = &mut sleep, if !sleep.is_elapsed() => {
-                    println!("operation timed out");
+                () = &mut sleep, if !sleep.is_elapsed() => {
+                    tracing::info!("Search for confirm button is timed out");
                 }
                 Ok(player_root) = wd.find(By::Id("player-root")), if sleep.is_elapsed() => {
                     print_err!(player_root.click().await, ());
                     break;
+                }
+                else => {
+                    tracing::warn!("Can't find player-root or confirm-button, trying again");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
@@ -207,12 +252,11 @@ async fn store_video(
                 saver_tx
                     .send(VideoInfo {
                         path: merge_path(filepath),
-                        name: format!("{}.mp4", uuid::Uuid::new_v4()),
                         urls,
                     })
                     .await?;
             }
-            Err(e) => println!("Failed to get urls: {e}"),
+            Err(e) => tracing::error!("Failed to get urls: {e}"),
         }
         // Go back from iframe
         wd.enter_parent_frame().await.unwrap();
@@ -226,12 +270,46 @@ async fn run_proxy() -> Result<Sender<Signal>, anyhow::Error> {
     Ok(tx)
 }
 
+async fn wait_video_saver(handle: JoinHandle<Vec<(VideoInfo, anyhow::Error)>>) {
+    match handle.await {
+        Ok(failed) => {
+            if failed.is_empty() {
+                tracing::info!(
+                    "There are no failed videos to download, congratulations!"
+                );
+            } else {
+                tracing::warn!("Got failed videos to download: {:?}", failed);
+                match serde_json::to_string_pretty(
+                    &failed
+                        .into_iter()
+                        .map(|(info, _)| info)
+                        .collect::<Vec<VideoInfo>>(),
+                ) {
+                    Ok(s) => print_err!(
+                        write_file("failed_videos_data.json", &s),
+                        ()
+                    ),
+                    Err(e) => tracing::error!(
+                        "Failed to serialize failed videos data: {e}"
+                    ),
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to join video saver: {}", e);
+        }
+    }
+}
+
 // ───── Helpers ──────────────────────────────────────────────────────────── //
 
 async fn load_root_page(
     wd: &WebDriver,
     domain: &str,
     root: &str,
+    password: &str,
+    email: &str,
+    auth_url: &str,
 ) -> Result<(), anyhow::Error> {
     match read_cookies() {
         Ok(cookies) => {
@@ -242,19 +320,15 @@ async fn load_root_page(
             wd.goto(&format!("{}:{}", domain, root)).await?;
         }
         Err(e) => {
-            println!("Failed to read cookies: {e}");
-            let unauthorized_url =
-                "https://universkill.ru/cms/system/login?required=true";
-            wd.goto(unauthorized_url).await?;
-            println!("Waiting for email field");
+            tracing::info!("Failed to read cookies: {e}");
+            wd.goto(auth_url).await?;
             wd.find(By::Css("input.form-field-email"))
                 .await?
-                .send_keys("")
+                .send_keys(email)
                 .await?;
-            println!("Waiting for password field");
             wd.find(By::Css("input.form-field-password"))
                 .await?
-                .send_keys("")
+                .send_keys(password)
                 .await?;
             wd.find(By::Css("button.btn-success-sech"))
                 .await?
@@ -270,8 +344,12 @@ async fn load_root_page(
 
 fn store_cookies(cookies: Vec<Cookie>) -> anyhow::Result<()> {
     let cookies = serde_json::to_string(&cookies)?;
-    let mut output = File::create("cookie.txt").unwrap();
-    write!(output, "{}", cookies)?;
+    write_file("cookie.txt", &cookies)
+}
+
+fn write_file(filepath: &str, content: &str) -> anyhow::Result<()> {
+    let mut output = File::create(filepath).unwrap();
+    write!(output, "{}", content)?;
     Ok(())
 }
 
