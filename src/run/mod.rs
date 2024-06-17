@@ -337,6 +337,7 @@ async fn load_root_page(
 
             let cookies = wd.get_all_cookies().await?;
             store_cookies(cookies)?;
+            tracing::info!("Finished to store cookies");
         }
     }
     Ok(())

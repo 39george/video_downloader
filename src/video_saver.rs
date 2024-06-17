@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::BufWriter;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::{path::PathBuf, process::Stdio};
@@ -9,7 +11,7 @@ use tokio::sync::mpsc::Receiver;
 
 fn urls_regex() -> &'static Regex {
     static HREF_REGEX: OnceLock<Regex> = OnceLock::new();
-    HREF_REGEX.get_or_init(|| Regex::new(r#"(?P<domain>[^:]+):[0-9]+\/player\/(?P<id>[^\/]+)\/[^\/]+\/media\/(?P<file>[^?]+)\.m3u8.*"#).unwrap())
+    HREF_REGEX.get_or_init(|| Regex::new(r#"(?P<domain>[^:]+):[0-9]+\/player\/(?P<id>[^\/]+)\/[^\/]+(\/media)?\/(?P<file>[^?]+)\.m3u8.*"#).unwrap())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -28,13 +30,21 @@ impl FromStr for VideoInfo {
 pub struct VideoSaver {
     rx: Receiver<VideoInfo>,
     failed: Vec<(VideoInfo, anyhow::Error)>,
+    ffmpeg_output: File,
 }
 
 impl VideoSaver {
     pub fn new(rx: Receiver<VideoInfo>) -> Self {
+        let ffmpeg_output = File::options()
+            .create(true)
+            .append(true)
+            .write(true)
+            .open("ffmpeg.log")
+            .expect("Can't open ffmpeg log file!");
         VideoSaver {
             rx,
             failed: Vec::new(),
+            ffmpeg_output,
         }
     }
 
@@ -47,7 +57,7 @@ impl VideoSaver {
                     "Got video info, start downloading, currently in queue: {}",
                     self.rx.len()
                 );
-                match write_file(video_info).await {
+                match self.write_file(video_info).await {
                     Ok(path) => tracing::info!(
                         "Succesfully downloaded file: {}",
                         path.to_string_lossy()
@@ -61,52 +71,64 @@ impl VideoSaver {
             self.failed
         })
     }
-}
 
-async fn write_file(
-    video_info: VideoInfo,
-) -> Result<PathBuf, (VideoInfo, anyhow::Error)> {
-    let url = select_url(video_info.urls.clone())
-        .map_err(|e| (video_info.clone(), e))?
-        .extract();
-    let path = PathBuf::from(format!("./{}", video_info.path));
-    if let Err(err) = std::fs::create_dir_all(&path) {
-        tracing::error!("Error creating directory: {}", err);
-    } else {
-        tracing::info!("Directory created successfully!");
-    }
+    async fn write_file(
+        &self,
+        video_info: VideoInfo,
+    ) -> Result<PathBuf, (VideoInfo, anyhow::Error)> {
+        let url = select_url(video_info.urls.clone())
+            .map_err(|e| (video_info.clone(), e))?
+            .extract();
+        let path = PathBuf::from(format!("./{}", video_info.path));
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            tracing::error!("Error creating directory: {}", err);
+        } else {
+            tracing::info!("Directory created successfully!");
+        }
 
-    let filepath = path.join(format!("{}.mp4", hash_string(&url)));
+        let filepath = path.join(format!("{}.mp4", hash_string(&url)));
 
-    if filepath.exists() {
-        tracing::warn!(
-            "File already exists, skip: {}",
-            filepath.to_string_lossy()
-        );
-    }
+        if filepath.exists() {
+            tracing::warn!(
+                "File already exists, skip: {}",
+                filepath.to_string_lossy()
+            );
+            return Ok(filepath);
+        }
 
-    let mut child = tokio::process::Command::new("ffmpeg")
-        .args(&[
-            "-protocol_whitelist",
-            "file,http,https,tcp,tls",
-            "-i",
-            &url,
-            "-c",
-            "copy",
-            filepath.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| (video_info.clone(), anyhow!("Failed: {e}")))?;
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| (video_info.clone(), anyhow!("Failed: {e}")))?;
-    if status.success() {
-        Ok(filepath)
-    } else {
-        Err((video_info, anyhow!("Failed: exited with nonzero code")))
+        let mut child = tokio::process::Command::new("ffmpeg")
+            .args(&[
+                "-protocol_whitelist",
+                "file,http,https,tcp,tls",
+                "-i",
+                &url,
+                "-c",
+                "copy",
+                filepath.to_str().unwrap(),
+            ])
+            .stdout(self.ffmpeg_output.try_clone().map_err(|e| {
+                (
+                    video_info.clone(),
+                    anyhow!("Failed to clone ffmpeg stdout file handle: {e}"),
+                )
+            })?)
+            .stderr(self.ffmpeg_output.try_clone().map_err(|e| {
+                (
+                    video_info.clone(),
+                    anyhow!("Failed to clone ffmpeg stderr file handle: {e}"),
+                )
+            })?)
+            .spawn()
+            .map_err(|e| (video_info.clone(), anyhow!("Failed: {e}")))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| (video_info.clone(), anyhow!("Failed: {e}")))?;
+        if status.success() {
+            Ok(filepath)
+        } else {
+            Err((video_info, anyhow!("Failed: exited with nonzero code")))
+        }
     }
 }
 
@@ -204,7 +226,14 @@ mod tests {
     fn testme() {
         let urls = vec!["https://player02.getcourse.ru:443/player/211deb093b64e367becbdd4d130e0a29/2b0d302f8e569d2ce309d4429e518dd8/media/360.m3u8?sid=&user-cdn=cdnvideo&version=10%3A2%3A1%3A0%3Acdnvideo&user-id=221868265&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string(),
                         "https://player02.getcourse.ru:443/player/211deb093b64e367becbdd4d130e0a29/2b0d302f8e569d2ce309d4429e518dd8/media/580.m3u8?sid=&user-cdn=cdnvideo&version=10%3A2%3A1%3A0%3Acdnvideo&user-id=221868265&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string(),
-                        "https://player02.getcourse.ru:443/player/211deb093b64e367becbdd4d130e0a29/2b0d302f8e569d2ce309d4429e518dd8/media/480.m3u8?sid=&user-cdn=cdnvideo&version=10%3A2%3A1%3A0%3Acdnvideo&user-id=221868265&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string()];
+                        "https://player02.getcourse.ru:443/player/211deb093b64e367becbdd4d130e0a29/2b0d302f8e569d2ce309d4429e518dd8/media/480.m3u8?sid=&user-cdn=cdnvideo&version=10%3A2%3A1%3A0%3Acdnvideo&user-id=221868265&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string(),
+                        "https://player02.getcourse.ru:443/player/d577fb479e3afb177663fdc27a90a46b/bcedaa97e91a4e83f336ee76904cd537/master.m3u8?user-cdn=cdnvideo&acc-id=253685&user-id=221868265&loc-mode=ru&version=10%3A2%3A1%3A1%3A2%3Acdnvideo&consumer=vod&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string(),
+                        "https://player02.getcourse.ru:443/player/a3404f00e961b8dffd373b0dab2b4559/87e7ec1b5a2a2f2a4f32bfb3c2e2312c/master.m3u8?user-cdn=integrosproxy&acc-id=253685&user-id=221868265&loc-mode=ru&version=10%3A2%3A1%3A1%3A2%3Aintegrosproxy&consumer=vod&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string(),
+                        "https://player02.getcourse.ru:443/player/2d42f5470d4861b544643414ac32f1f3/ec79d2a18ad2cfbf03ad271f056f2516/master.m3u8?user-cdn=cdnvideo&acc-id=253685&user-id=221868265&loc-mode=ru&version=10%3A2%3A1%3A1%3A2%3Acdnvideo&consumer=vod&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string(),
+                        "https://player02.getcourse.ru:443/player/55643edf6feaa2ad978de6f876cde83a/623dee040a7b8492a34a73b26b2e4032/master.m3u8?user-cdn=cdnvideo&acc-id=253685&user-id=221868265&loc-mode=ru&version=10%3A2%3A1%3A1%3A2%3Acdnvideo&consumer=vod&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string(),
+                        "https://player02.getcourse.ru:443/player/d577fb479e3afb177663fdc27a90a46b/bcedaa97e91a4e83f336ee76904cd537/media/360.m3u8?sid=&user-cdn=cdnvideo&version=10%3A2%3A1%3A1%3Acdnvideo&user-id=221868265&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string(),
+                        "https://player02.getcourse.ru:443/player/d577fb479e3afb177663fdc27a90a46b/bcedaa97e91a4e83f336ee76904cd537/media/480.m3u8?sid=&user-cdn=cdnvideo&version=10%3A2%3A1%3A1%3Acdnvideo&user-id=221868265&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyLWlkIjoyMjE4NjgyNjV9.0piDRlkDE13G3KXLTLopsIPSGeIXa8f3zyACc1aqzNU".to_string()];
+
         let selected = select_url(urls).unwrap();
         dbg!(selected);
     }
